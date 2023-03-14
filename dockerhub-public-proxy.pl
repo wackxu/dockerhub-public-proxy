@@ -2,6 +2,7 @@
 use Mojo::Base -strict, -signatures;
 
 use Mojo::UserAgent;
+use Mojo::UserAgent::CookieJar;
 
 # optional configuration for Docker Hub credentials to help with rate limiting
 # WARNING: this will allow unauthenticated access for anyone who can hit the proxy to anything this user has access to, so please use it with care!!
@@ -9,7 +10,7 @@ use Mojo::UserAgent;
 # https://github.com/docker/hub-feedback/issues/1907
 my @creds = split(/\n/, Mojo::Util::trim($ENV{DOCKERHUB_PUBLIC_PROXY_CREDENTIALS} // ''));
 
-my $ua = Mojo::UserAgent->new->max_redirects(0)->connect_timeout(20)->inactivity_timeout(20)->max_response_size(1024 * 1024);
+my $ua = Mojo::UserAgent->new->max_redirects(0)->connect_timeout(20)->inactivity_timeout(20)->max_response_size(1024 * 1024)->insecure(1);
 $ua->transactor->name(join ' ',
 	# https://github.com/docker/docker/blob/v1.11.2/dockerversion/useragent.go#L13-L34
 	'docker/1.11.2',
@@ -20,6 +21,8 @@ $ua->transactor->name(join ' ',
 	'arch/amd64',
 	# BOGUS USER AGENTS FOR THE BOGUS USER AGENT THRONE
 );
+
+$ua->cookie_jar->ignore(sub { 1 });
 
 # the number of times to allow a single request to be attempted before considering it a lost cause
 my $uaTries = 2;
@@ -92,6 +95,11 @@ sub _registry_req_p {
 	return ua_retry_req_p($method => $url => \%headers)->then(sub {
 		my $tx = shift;
 		if (!$lastTry && $tx->res->code == 401) {
+		    print "method: " . $method . " url: " . $url . " header: " . "@{[%headers]}" . "\n";
+
+		    print "\nRESPONSE:\n" . $tx->res->to_string . "\n";
+		    print "resp body" .  $tx->res->body . "\n";
+		    print "\nresp header: " . $tx->res->headers->to_string . "\n";
 			# "Unauthorized" -- we must need to go fetch a token for this registry request (so let's go do that, then retry the original registry request)
 			my $auth = $tx->res->headers->www_authenticate;
 			die "unexpected WWW-Authenticate header: $auth" unless $auth =~ m{ ^ Bearer \s+ (\S.*) $ }x;
@@ -105,11 +113,13 @@ sub _registry_req_p {
 				,?
 			}xg) {
 				my ($key, $val) = ($1, $2);
-				next if $key eq 'error';
+				next if $key eq 'error' and $val eq 'invalid_token';
 				if ($key eq 'realm') {
+				    print "realm ..........";
 					$authUrl->base(Mojo::URL->new($val));
 				} else {
-					$authUrl->query->append($key => $val);
+				    print "not realm ..........";
+					$authUrl->query->append($key => $_) for split / /, $val; # Docker's auth server expects "scope=xxx&scope=yyy" instead of "scope=xxx%20yyy"
 				}
 			}
 			$authUrl = $authUrl->to_abs;
@@ -117,6 +127,9 @@ sub _registry_req_p {
 				# see description of DOCKERHUB_PUBLIC_PROXY_CREDENTIALS above
 				$authUrl->userinfo($cred);
 			}
+
+			print "$authUrl" . $authUrl->to_string . "\n";
+
 			return ua_retry_req_p(get => $authUrl->to_unsafe_string)->then(sub {
 				my $tokenTx = shift;
 				if (my $error = $tokenTx->error) {
@@ -136,7 +149,7 @@ sub registry_req_p {
 	my $url = shift;
 	my %extHeaders = @_;
 
-	$url = "https://registry-1.docker.io/v2/$repo/$url";
+	$url = "https://testhub.com/v2/$repo/$url";
 
 	return _registry_req_p($uaTries, $method, $repo, $url, %extHeaders);
 }
@@ -148,6 +161,8 @@ any [ 'GET', 'HEAD' ] => '/v2/#org/#repo/*url' => sub ($c) {
 
 	my $repo = $c->param('org') . '/' . $c->param('repo');
 	my $url = $c->param('url');
+
+	print "------- repo: " . $repo . "; url: " . $url . "\n";
 
 	# ignore request headers (they can cause issues with returning the wrong "Location:" redirects thanks to X-Forwarded-*, for example)
 	my %headers = (
